@@ -1,0 +1,45 @@
+persistence:
+  databases:
+    PERSISTENCE_ONE:
+      r2dbc-url: "${PERSISTENCE_ONE_R2DBC_URL}"
+      username: "${PERSISTENCE_ONE_USER}"
+      password: "${PERSISTENCE_ONE_PASS}"
+      pool:
+        initial-size: 1
+        max-size: 10
+        max-idle-time: 10m
+        max-acquire-time: 15s
+        validation-query: "SELECT 1"
+
+    PERSISTENCE_TWO:
+      r2dbc-url: "${PERSISTENCE_TWO_R2DBC_URL}"
+      username: "${PERSISTENCE_TWO_USER}"
+      password: "${PERSISTENCE_TWO_PASS}"
+      pool:
+        initial-size: 1
+        max-size: 10
+        max-idle-time: 10m
+        max-acquire-time: 15s
+        validation-query: "SELECT 1"
+
+    PERSISTENCE_THREE:
+      r2dbc-url: "${PERSISTENCE_THREE_R2DBC_URL}"
+      username: "${PERSISTENCE_THREE_USER}"
+      password: "${PERSISTENCE_THREE_PASS}"
+      pool:
+        initial-size: 1
+        max-size: 10
+        max-idle-time: 10m
+        max-acquire-time: 15s
+        validation-query: "SELECT 1"
+
+    PERSISTENCE_FOUR:
+      r2dbc-url: "${PERSISTENCE_FOUR_R2DBC_URL}"
+      username: "${PERSISTENCE_FOUR_USER}"
+      password: "${PERSISTENCE_FOUR_PASS}"
+      pool:
+        initial-size: 1
+        max-size: 10
+        max-idle-time: 10m
+        max-acquire-time: 15s
+        validation-query: "SELECT 1"

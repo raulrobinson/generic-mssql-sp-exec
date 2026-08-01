@@ -8,9 +8,9 @@ import reactor.core.publisher.Mono;
 
 public interface StoredProcedureGateway {
 
-    Mono<ProcedureDefinition> describe(String schema, String procedure);
+    Mono<ProcedureDefinition> describe(String databaseKey, String schema, String procedure);
 
     Mono<ProcedureExecutionResult> execute(ExecuteProcedureCommand command);
 
-    Flux<String> allowedProcedures();
+    Flux<String> allowedProcedures(String databaseKey);
 }

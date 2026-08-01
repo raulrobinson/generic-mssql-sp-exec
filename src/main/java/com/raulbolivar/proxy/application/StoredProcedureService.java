@@ -24,20 +24,20 @@ public class StoredProcedureService {
         this.properties = properties;
     }
 
-    public Mono<ProcedureDefinition> describe(String schema, String procedure) {
+    public Mono<ProcedureDefinition> describe(String databaseKey, String schema, String procedure) {
         String effectiveSchema = normalize(schema);
         validate(effectiveSchema, procedure);
-        return gateway.describe(effectiveSchema, procedure);
+        return gateway.describe(databaseKey, effectiveSchema, procedure);
     }
 
     public Mono<ProcedureExecutionResult> execute(ExecuteProcedureCommand command) {
         String schema = normalize(command.schema());
         validate(schema, command.procedure());
-        return gateway.execute(new ExecuteProcedureCommand(schema, command.procedure(), command.parameters()));
+        return gateway.execute(new ExecuteProcedureCommand(command.databaseKey(), schema, command.procedure(), command.parameters()));
     }
 
-    public Mono<List<String>> allowedProcedures() {
-        return gateway.allowedProcedures().collectList();
+    public Mono<List<String>> allowedProcedures(String databaseKey) {
+        return gateway.allowedProcedures(databaseKey).collectList();
     }
 
     private String normalize(String schema) {

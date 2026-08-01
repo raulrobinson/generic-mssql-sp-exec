@@ -1,7 +1,9 @@
-package com.raulbolivar.proxy.api;
+package com.raulbolivar.proxy.api.error;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raulbolivar.proxy.infrastructure.StoredProcedureExecutionException;
+import jakarta.annotation.Nonnull;
+import lombok.RequiredArgsConstructor;
 import org.springframework.boot.web.reactive.error.ErrorWebExceptionHandler;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -18,16 +20,13 @@ import java.util.NoSuchElementException;
 
 @Component
 @Order(-2)
+@RequiredArgsConstructor
 public class GlobalErrorHandler implements ErrorWebExceptionHandler {
 
     private final ObjectMapper objectMapper;
 
-    public GlobalErrorHandler(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
-
     @Override
-    public Mono<Void> handle(ServerWebExchange exchange, Throwable error) {
+    public @Nonnull Mono<Void> handle(ServerWebExchange exchange, @Nonnull Throwable error) {
         if (exchange.getResponse().isCommitted()) return Mono.error(error);
 
         HttpStatus status;

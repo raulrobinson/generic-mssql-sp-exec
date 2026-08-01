@@ -1,4 +1,4 @@
-package com.raulbolivar.proxy.api;
+package com.raulbolivar.proxy.api.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import java.util.Map;

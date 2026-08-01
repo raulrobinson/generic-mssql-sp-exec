@@ -8,7 +8,6 @@ import com.raulbolivar.proxy.domain.ProcedureExecutionResult;
 import com.raulbolivar.proxy.domain.ProcedureParameter;
 import com.raulbolivar.proxy.helper.XmlOutputConverter;
 import io.r2dbc.spi.*;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.stereotype.Repository;
 import reactor.core.publisher.Flux;
@@ -21,53 +20,59 @@ import java.util.function.Function;
 @Repository
 public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
 
-    private static final String OUTPUT_PREFIX          = "__sp_out__";
-    private static final String BINDING_PREFIX         = "P";
+    private static final String OUTPUT_PREFIX = "__sp_out__";
+    private static final String BINDING_PREFIX = "P";
     private static final String OUTPUT_VARIABLE_PREFIX = "@__out_";
-    private static final String INPUT_VARIABLE_PREFIX  = "@__in_";
+    private static final String INPUT_VARIABLE_PREFIX = "@__in_";
 
-    private final ConnectionFactory         connectionFactory;
-    private final DatabaseClient            databaseClient;
+    private static final String SQL_DESCRIBE = """
+            SELECT p.parameter_id, p.name, t.name AS type_name, p.max_length,
+                   p.precision, p.scale, p.is_output, p.is_nullable, p.has_default_value
+            FROM sys.procedures sp
+            INNER JOIN sys.schemas s ON s.schema_id = sp.schema_id
+            INNER JOIN sys.parameters p ON p.object_id = sp.object_id
+            INNER JOIN sys.types t ON t.user_type_id = p.user_type_id
+            WHERE s.name = :schema
+              AND sp.name = :procedure
+              AND p.parameter_id > 0
+            ORDER BY p.parameter_id
+            """;
+
+    private static final String SQL_EXISTS = """
+            SELECT COUNT(*) AS total
+            FROM sys.procedures p
+            INNER JOIN sys.schemas s ON s.schema_id = p.schema_id
+            WHERE s.name = :schema AND p.name = :procedure
+            """;
+
+    private static final String SQL_ALLOWED = """
+            SELECT s.name + '.' + p.name AS procedure_name
+            FROM sys.procedures p
+            INNER JOIN sys.schemas s ON s.schema_id = p.schema_id
+            WHERE p.is_ms_shipped = 0
+            ORDER BY s.name, p.name
+            """;
+
+    private final ConnectionFactoryRegistry registry;
     private final StoredProcedureProperties properties;
-    private final R2dbcTypeMapper           typeMapper;
-    private final XmlOutputConverter        xmlOutputConverter;
+    private final R2dbcTypeMapper typeMapper;
+    private final XmlOutputConverter xmlOutputConverter;
 
-    public R2dbcStoredProcedureAdapter(
-            @Qualifier("persistenceConnectionFactory") ConnectionFactory connectionFactory,
-            @Qualifier("persistenceDatabaseClient") DatabaseClient databaseClient,
-            StoredProcedureProperties properties,
-            R2dbcTypeMapper typeMapper,
-            XmlOutputConverter xmlOutputConverter) {
-        this.connectionFactory = connectionFactory;
-        this.databaseClient = databaseClient;
+    public R2dbcStoredProcedureAdapter(ConnectionFactoryRegistry registry,
+                                       StoredProcedureProperties properties,
+                                       R2dbcTypeMapper typeMapper,
+                                       XmlOutputConverter xmlOutputConverter) {
+        this.registry = registry;
         this.properties = properties;
         this.typeMapper = typeMapper;
         this.xmlOutputConverter = xmlOutputConverter;
     }
 
     @Override
-    public Mono<ProcedureDefinition> describe(String schema, String procedure) {
-        String sql = """
-                SELECT p.parameter_id,
-                       p.name,
-                       t.name AS type_name,
-                       p.max_length,
-                       p.precision,
-                       p.scale,
-                       p.is_output,
-                       p.is_nullable,
-                       p.has_default_value
-                FROM sys.procedures sp
-                INNER JOIN sys.schemas s ON s.schema_id = sp.schema_id
-                INNER JOIN sys.parameters p ON p.object_id = sp.object_id
-                INNER JOIN sys.types t ON t.user_type_id = p.user_type_id
-                WHERE s.name = :schema
-                  AND sp.name = :procedure
-                  AND p.parameter_id > 0
-                ORDER BY p.parameter_id
-                """;
+    public Mono<ProcedureDefinition> describe(String databaseKey, String schema, String procedure) {
+        DatabaseClient client = registry.getDatabaseClient(databaseKey);
 
-        return databaseClient.sql(sql)
+        return client.sql(SQL_DESCRIBE)
                 .bind("schema", schema)
                 .bind("procedure", procedure)
                 .map((row, metadata) -> mapParameter(row))
@@ -78,40 +83,37 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
                         return Mono.just(new ProcedureDefinition(schema, procedure, parameters));
                     }
 
-                    return exists(schema, procedure)
+                    return exists(client, schema, procedure)
                             .flatMap(found -> found
                                     ? Mono.just(new ProcedureDefinition(schema, procedure, List.of()))
                                     : Mono.error(new NoSuchElementException(
-                                    "No existe el procedimiento " + schema + "." + procedure)));
+                                            "No existe el procedimiento " + schema + "." + procedure
+                                                    + " en la base " + databaseKey)));
                 })
                 .onErrorMap(this::mapException);
     }
 
     @Override
     public Mono<ProcedureExecutionResult> execute(ExecuteProcedureCommand command) {
-        return describe(command.schema(), command.procedure())
+        ConnectionFactory connectionFactory = registry.getConnectionFactory(command.databaseKey());
+
+        return describe(command.databaseKey(), command.schema(), command.procedure())
                 .flatMap(definition -> {
                     validateInputParameters(definition, command.parameters());
-                    return withConnection(connection -> execute(connection, command, definition));
+                    return withConnection(connectionFactory,
+                            connection -> execute(connection, command, definition));
                 })
                 .onErrorMap(this::mapException);
     }
 
     @Override
-    public Flux<String> allowedProcedures() {
+    public Flux<String> allowedProcedures(String databaseKey) {
         if (properties.allowed() != null && !properties.allowed().isEmpty()) {
             return Flux.fromIterable(properties.allowed()).sort();
         }
 
-        String sql = """
-                SELECT s.name + '.' + p.name AS procedure_name
-                FROM sys.procedures p
-                INNER JOIN sys.schemas s ON s.schema_id = p.schema_id
-                WHERE p.is_ms_shipped = 0
-                ORDER BY s.name, p.name
-                """;
-
-        return databaseClient.sql(sql)
+        return registry.getDatabaseClient(databaseKey)
+                .sql(SQL_ALLOWED)
                 .map((row, metadata) -> row.get("procedure_name", String.class))
                 .all()
                 .onErrorMap(this::mapException);
@@ -139,8 +141,7 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
                     }
 
                     if (segment instanceof Result.UpdateCount updateCount) {
-                        return Mono.just(new SegmentData.UpdateData(
-                                Math.toIntExact(updateCount.value())));
+                        return Mono.just(new SegmentData.UpdateData(Math.toIntExact(updateCount.value())));
                     }
 
                     return Mono.empty();
@@ -170,8 +171,8 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         Map<String, Object> outputs = new LinkedHashMap<>();
         List<List<Map<String, Object>>> resultSets = new ArrayList<>();
         List<Integer> updateCounts = new ArrayList<>();
-
         Map<String, ProcedureParameter> outputDefinitions = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+
         definition.parameters().stream()
                 .filter(ProcedureParameter::output)
                 .forEach(parameter -> outputDefinitions.put(parameter.name(), parameter));
@@ -191,13 +192,15 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
 
             first.forEach((key, value) -> {
                 String parameterName = key.substring(OUTPUT_PREFIX.length());
-                ProcedureParameter parameter = outputDefinitions.get(parameterName);
-                outputs.put(parameterName, normalizeOutput(value, parameter));
+                outputs.put(parameterName,
+                        normalizeOutput(value, outputDefinitions.get(parameterName)));
             });
         }
 
         return new ProcedureExecutionResult(
-                command.schema(), command.procedure(), outputs, resultSets, updateCounts);
+                command.databaseKey(), command.schema(), command.procedure(),
+                outputs, resultSets, updateCounts
+        );
     }
 
     private Object normalizeOutput(Object value, ProcedureParameter parameter) {
@@ -215,7 +218,6 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         StringBuilder sql = new StringBuilder("SET NOCOUNT ON;\n");
         List<BindingValue> bindings = new ArrayList<>();
         List<String> arguments = new ArrayList<>();
-
         List<ProcedureParameter> outputs = definition.parameters().stream()
                 .filter(ProcedureParameter::output)
                 .toList();
@@ -228,37 +230,26 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
             if (parameter.output()) {
                 String outputVariable = outputVariable(parameter);
 
-                sql.append("DECLARE ")
-                        .append(outputVariable)
-                        .append(' ')
-                        .append(sqlDeclaration(parameter))
-                        .append(";\n");
+                sql.append("DECLARE ").append(outputVariable).append(' ')
+                        .append(sqlDeclaration(parameter)).append(";\n");
 
                 if (supplied) {
                     String marker = BINDING_PREFIX + bindingIndex++;
                     Object value = findIgnoreCase(input, parameter.name());
 
                     if (isXml(parameter)) {
-                        sql.append("SET ")
-                                .append(outputVariable)
-                                .append(" = CONVERT(xml, @")
-                                .append(marker)
-                                .append(");\n");
+                        sql.append("SET ").append(outputVariable)
+                                .append(" = CONVERT(xml, @").append(marker).append(");\n");
                     } else {
-                        sql.append("SET ")
-                                .append(outputVariable)
-                                .append(" = @")
-                                .append(marker)
-                                .append(";\n");
+                        sql.append("SET ").append(outputVariable)
+                                .append(" = @").append(marker).append(";\n");
                     }
 
-                    bindings.add(new BindingValue(
-                            marker, value, parameter, isXml(parameter)));
+                    bindings.add(new BindingValue(marker, value, parameter, isXml(parameter)));
                 }
 
                 arguments.add(quotedParameter(parameter.name())
                         + " = " + outputVariable + " OUTPUT");
-
                 continue;
             }
 
@@ -268,15 +259,9 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
 
                 if (isXml(parameter)) {
                     String inputVariable = inputVariable(parameter);
-
-                    sql.append("DECLARE ")
-                            .append(inputVariable)
-                            .append(" xml;\n")
-                            .append("SET ")
-                            .append(inputVariable)
-                            .append(" = CONVERT(xml, @")
-                            .append(marker)
-                            .append(");\n");
+                    sql.append("DECLARE ").append(inputVariable).append(" xml;\n")
+                            .append("SET ").append(inputVariable)
+                            .append(" = CONVERT(xml, @").append(marker).append(");\n");
 
                     arguments.add(quotedParameter(parameter.name()) + " = " + inputVariable);
                     bindings.add(new BindingValue(marker, value, parameter, true));
@@ -291,14 +276,8 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
             if (!parameter.hasDefault()) {
                 if (isXml(parameter)) {
                     String inputVariable = inputVariable(parameter);
-
-                    sql.append("DECLARE ")
-                            .append(inputVariable)
-                            .append(" xml;\n")
-                            .append("SET ")
-                            .append(inputVariable)
-                            .append(" = NULL;\n");
-
+                    sql.append("DECLARE ").append(inputVariable).append(" xml;\n")
+                            .append("SET ").append(inputVariable).append(" = NULL;\n");
                     arguments.add(quotedParameter(parameter.name()) + " = " + inputVariable);
                 } else {
                     String marker = BINDING_PREFIX + bindingIndex++;
@@ -308,28 +287,18 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
             }
         }
 
-        sql.append("EXEC ")
-                .append(quotedIdentifier(definition.schema()))
-                .append('.')
-                .append(quotedIdentifier(definition.name()));
+        sql.append("EXEC ").append(quotedIdentifier(definition.schema()))
+                .append('.').append(quotedIdentifier(definition.name()));
 
-        if (!arguments.isEmpty()) {
-            sql.append("\n    ").append(String.join(",\n    ", arguments));
-        }
-
+        if (!arguments.isEmpty()) sql.append("\n    ").append(String.join(",\n    ", arguments));
         sql.append(";\n");
 
         if (!outputs.isEmpty()) {
             sql.append("SELECT\n    ");
-
             for (int index = 0; index < outputs.size(); index++) {
-                if (index > 0) {
-                    sql.append(",\n    ");
-                }
-
+                if (index > 0) sql.append(",\n    ");
                 sql.append(outputSelectExpression(outputs.get(index)));
             }
-
             sql.append(";\n");
         }
 
@@ -341,16 +310,11 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         String alias = quotedIdentifier(OUTPUT_PREFIX + parameter.name());
 
         return switch (normalizedType(parameter)) {
-            case "xml" ->
-                    "CAST(" + variable + " AS nvarchar(max)) AS " + alias;
-
-            case "sql_variant" ->
-                    "CONVERT(nvarchar(max), " + variable + ") AS " + alias;
-
+            case "xml" -> "CAST(" + variable + " AS nvarchar(max)) AS " + alias;
+            case "sql_variant" -> "CONVERT(nvarchar(max), " + variable + ") AS " + alias;
             case "geometry", "geography", "hierarchyid" ->
                     "CASE WHEN " + variable + " IS NULL THEN NULL ELSE "
                             + variable + ".ToString() END AS " + alias;
-
             default -> variable + " AS " + alias;
         };
     }
@@ -365,7 +329,6 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
                 Class<?> nullType = binding.bindAsString()
                         ? String.class
                         : typeMapper.nullType(binding.parameter());
-
                 statement.bindNull(binding.marker(), nullType);
             } else {
                 statement.bind(binding.marker(), converted);
@@ -373,16 +336,8 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         }
     }
 
-    private Mono<Boolean> exists(String schema, String procedure) {
-        String sql = """
-                SELECT COUNT(*) AS total
-                FROM sys.procedures p
-                INNER JOIN sys.schemas s ON s.schema_id = p.schema_id
-                WHERE s.name = :schema
-                  AND p.name = :procedure
-                """;
-
-        return databaseClient.sql(sql)
+    private Mono<Boolean> exists(DatabaseClient client, String schema, String procedure) {
+        return client.sql(SQL_EXISTS)
                 .bind("schema", schema)
                 .bind("procedure", procedure)
                 .map((row, metadata) -> number(row.get("total")))
@@ -416,12 +371,10 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
                 values.put(name, normalize(row.get(name)));
             } catch (RuntimeException exception) {
                 throw new StoredProcedureExecutionException(
-                        0,
-                        null,
+                        0, null,
                         "No fue posible decodificar la columna '" + name
                                 + "'. El Stored Procedure puede retornar un tipo no soportado "
-                                + "por r2dbc-mssql, como xml, sql_variant, geometry, "
-                                + "geography o hierarchyid.",
+                                + "por r2dbc-mssql, como xml, sql_variant, geometry, geography o hierarchyid.",
                         exception
                 );
             }
@@ -442,19 +395,13 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         return switch (type) {
             case "varchar", "char", "varbinary", "binary" ->
                     type + length(parameter.maxLength());
-
             case "nvarchar", "nchar" ->
-                    type + length(parameter.maxLength() < 0
-                            ? -1
-                            : parameter.maxLength() / 2);
-
+                    type + length(parameter.maxLength() < 0 ? -1 : parameter.maxLength() / 2);
             case "decimal", "numeric" ->
-                    type + "(" + safePrecision(parameter.precision())
-                            + "," + safeScale(parameter.scale(), parameter.precision()) + ")";
-
+                    type + "(" + safePrecision(parameter.precision()) + ","
+                            + safeScale(parameter.scale(), parameter.precision()) + ")";
             case "datetime2", "datetimeoffset", "time" ->
                     type + "(" + Math.max(parameter.scale(), 0) + ")";
-
             default -> type;
         };
     }
@@ -464,8 +411,7 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
     }
 
     private int safeScale(int scale, int precision) {
-        int safePrecision = safePrecision(precision);
-        return Math.clamp(scale, 0, safePrecision);
+        return Math.max(0, Math.min(scale, safePrecision(precision)));
     }
 
     private String length(int value) {
@@ -474,9 +420,7 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
 
     private void validateInputParameters(ProcedureDefinition definition,
                                          Map<String, Object> input) {
-        if (input == null || input.isEmpty()) {
-            return;
-        }
+        if (input == null || input.isEmpty()) return;
 
         Set<String> known = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         definition.parameters().forEach(parameter -> known.add(parameter.name()));
@@ -490,26 +434,17 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
     }
 
     private RuntimeException mapException(Throwable error) {
-        if (error instanceof StoredProcedureExecutionException exception) {
-            return exception;
-        }
+        if (error instanceof StoredProcedureExecutionException exception) return exception;
 
         if (error instanceof R2dbcException exception) {
             return new StoredProcedureExecutionException(
-                    exception.getErrorCode(),
-                    exception.getSqlState(),
-                    exception.getMessage(),
-                    exception
+                    exception.getErrorCode(), exception.getSqlState(),
+                    exception.getMessage(), exception
             );
         }
 
-        if (error instanceof IllegalArgumentException exception) {
-            return exception;
-        }
-
-        if (error instanceof NoSuchElementException exception) {
-            return exception;
-        }
+        if (error instanceof IllegalArgumentException exception) return exception;
+        if (error instanceof NoSuchElementException exception) return exception;
 
         String message = error.getMessage() == null
                 ? error.getClass().getSimpleName()
@@ -518,19 +453,19 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
         return new StoredProcedureExecutionException(0, null, message, error);
     }
 
-    private <T> Mono<T> withConnection(Function<Connection, Mono<T>> action) {
+    private <T> Mono<T> withConnection(ConnectionFactory connectionFactory,
+                                       Function<Connection, Mono<T>> action) {
         return Mono.usingWhen(
                 Mono.from(connectionFactory.create()),
                 action,
                 this::closeConnection,
                 (connection, error) -> closeConnection(connection),
                 this::closeConnection
-        ).onErrorMap(this::mapException);
+        );
     }
 
     private Mono<Void> closeConnection(Connection connection) {
-        return Mono.from(connection.close())
-                .onErrorResume(error -> Mono.empty());
+        return Mono.from(connection.close()).onErrorResume(error -> Mono.empty());
     }
 
     private String outputVariable(ProcedureParameter parameter) {
@@ -564,24 +499,15 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
     }
 
     private static int number(Object value) {
-        if (value == null) {
-            return 0;
-        }
-
+        if (value == null) return 0;
         return value instanceof Number number
                 ? number.intValue()
                 : Integer.parseInt(value.toString());
     }
 
     private static boolean bool(Object value) {
-        if (value == null) {
-            return false;
-        }
-
-        if (value instanceof Boolean booleanValue) {
-            return booleanValue;
-        }
-
+        if (value == null) return false;
+        if (value instanceof Boolean booleanValue) return booleanValue;
         return value instanceof Number number
                 ? number.intValue() != 0
                 : Boolean.parseBoolean(value.toString());
@@ -597,9 +523,7 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
     }
 
     private static Object findIgnoreCase(Map<String, Object> map, String key) {
-        if (map == null || map.isEmpty()) {
-            return null;
-        }
+        if (map == null || map.isEmpty()) return null;
 
         return map.entrySet().stream()
                 .filter(entry -> entry.getKey().equalsIgnoreCase(key))
@@ -609,25 +533,18 @@ public class R2dbcStoredProcedureAdapter implements StoredProcedureGateway {
     }
 
     private sealed interface SegmentData {
-
-        record RowData(Map<String, Object> row) implements SegmentData {
-        }
-
-        record UpdateData(int count) implements SegmentData {
-        }
+        record RowData(Map<String, Object> row) implements SegmentData {}
+        record UpdateData(int count) implements SegmentData {}
     }
 
     private record ResultData(List<Map<String, Object>> rows,
-                              List<Integer> updateCounts) {
-    }
+                              List<Integer> updateCounts) {}
 
     private record BindingValue(String marker,
                                 Object value,
                                 ProcedureParameter parameter,
-                                boolean bindAsString) {
-    }
+                                boolean bindAsString) {}
 
     private record ExecutionSql(String sql,
-                                List<BindingValue> bindings) {
-    }
+                                List<BindingValue> bindings) {}
 }
