@@ -1,0 +1,6 @@
+app:
+  stored-procedures:
+    allowed:
+      - dbo.SpecificOne
+      - dbo.SpecificTwo
+      - dbo.SpecificThree
